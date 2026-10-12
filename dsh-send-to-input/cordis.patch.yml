@@ -1,0 +1,16 @@
+# Bundle patch for @local/dsh-send-to-input.
+#
+# One row mounts the package in the profile composition:
+#   * the Host half (index.js) is an intentional no-op — the feature has no Host
+#     face at all, because the browser half reaches everything it needs through
+#     Client services;
+#   * the `dsh.client` declaration makes the browser half (client.js) load into
+#     the open Web page, where it occupies one cell of the document preview's
+#     header toolbar slot `sidebar.right.tab.document.actions` and registers the
+#     `sendToInput.selection` shortcut.
+#
+# The row takes no config.
+
+- insert:
+    - id: send-to-input
+      name: '@local/dsh-send-to-input'
