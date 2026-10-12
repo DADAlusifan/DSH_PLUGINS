@@ -1,0 +1,11 @@
+# Bundle patch for @local/dsh-project-notes.
+#
+# One row mounts the package in the profile composition:
+#   * the Host half (index.js) registers the read-only workspace-notes HTTP API;
+#   * the `dsh.client` declaration makes the browser half (client.js) load into
+#     the open Web page, where it occupies the sidebar panel entry
+#     `sidebar.panellist` and the `main` panel keyed `project-notes`.
+
+- insert:
+    - id: project-notes
+      name: '@local/dsh-project-notes'
