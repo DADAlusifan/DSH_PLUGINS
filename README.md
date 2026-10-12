@@ -32,6 +32,25 @@ plugin_manager { action: "remove_bundle", target: "<包名>" }
 - 改 `index.js`（Host 半）→ 需要重启 DSH 才能换到新的模块代际
 - 改 `package.json` / `cordis.patch.yml` → 热生效
 
+## 远程仓库
+
+本文件夹同时是一个 Git 仓库，远程为 <https://github.com/DADAlusifan/DSH_PLUGINS>（公开仓），
+默认分支 `main` 已跟踪 `origin/main`。
+
+```
+git add -A
+git commit -m "feat: 说明这次改了什么"
+git push          # 已设置 upstream，无需再写 origin main
+```
+
+换一台机器恢复全部插件：
+
+```
+git clone https://github.com/DADAlusifan/DSH_PLUGINS.git D:\dsh-plugins
+```
+
+注意：**这是公开仓库**，别把密钥、token、个人路径之外的敏感信息提交进去。
+
 ## 新建一个插件
 
 最小四件套（照 DSH 自带的 `cordis-plugin-development` 技能模板）：
@@ -49,5 +68,5 @@ my-plugin\
 ## 注意事项
 
 - 因为是符号链接安装，**这里就是唯一的源码**，别再复制一份到别处，否则会改错文件。
-- 备份这个文件夹 == 备份所有插件。
+- 备份这个文件夹 == 备份所有插件；它本身是 Git 仓库，`git push` 到远程即完成备份。
 - 想让插件彻底独立于这个目录，可以 `pnpm pack` 打成 tarball 再安装（代价：失去热重载）。
