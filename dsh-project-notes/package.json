@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-project-notes",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "private": true,
   "description": "项目笔记 — 在侧栏增加入口，列出并预览当前工作区的 Markdown 文件",
   "type": "module",
@@ -12,10 +12,14 @@
   },
   "files": [
     "index.js",
+    "lib",
     "client.js",
     "cordis.patch.yml",
     "README.md"
   ],
+  "scripts": {
+    "test": "node --test \"test/*.test.js\""
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"

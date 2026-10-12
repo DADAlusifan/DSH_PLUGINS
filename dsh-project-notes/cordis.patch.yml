@@ -5,6 +5,19 @@
 #   * the `dsh.client` declaration makes the browser half (client.js) load into
 #     the open Web page, where it occupies the sidebar panel entry
 #     `sidebar.panellist` and the `main` panel keyed `project-notes`.
+#
+# Every field below is optional; omitting `config` uses the built-in defaults.
+# Values outside the documented range fall back to the default.
+#
+# - insert:
+#     - id: project-notes
+#       name: '@local/dsh-project-notes'
+#       config:
+#         extensions: ['.md', '.markdown', '.mdx']
+#         skipDirectories: ['node_modules', 'dist', 'build', 'out', 'coverage', 'vendor', 'target', '__pycache__', 'venv']
+#         maxNotes: 800          # 1 – 20000
+#         maxDepth: 8            # 0 – 64
+#         maxNoteBytes: 524288   # 1 KiB – 16 MiB
 
 - insert:
     - id: project-notes
