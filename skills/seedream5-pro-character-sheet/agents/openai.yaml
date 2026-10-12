@@ -1,0 +1,7 @@
+interface:
+  display_name: "Seedream 5 Pro 角色设定提示词"
+  short_description: "生成 Seedream 5 Pro 正面角色设定图提示词"
+  default_prompt: "Use $seedream5-pro-character-sheet to turn my character idea into a Seedream 5 Pro front-view character-sheet prompt."
+
+policy:
+  allow_implicit_invocation: true
