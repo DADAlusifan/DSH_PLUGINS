@@ -51,9 +51,10 @@ window.__ModuleLoader__.load({
 `;
     /** At most this much file text goes into one message. */
     const MAX_FILE_CHARS = 40000;
-    /** Lines asked of the file API per page. */
-    const PAGE_LINES = 5000;
-    /** Hard cap on pages, so a huge file still answers quickly. */
+    /**
+     * Hard cap on pages, so a huge file still answers quickly. No `limit` rides
+     * along: the Host answers its configured page size and refuses a larger one.
+     */
     const MAX_PAGES = 12;
     /** How long a transient hint stays on screen. */
     const HINT_MS = 2600;
@@ -71,6 +72,11 @@ window.__ModuleLoader__.load({
         busy: '输入框正在提交',
         unavailable: '文件读取不可用',
         readFailed: '读取文件失败',
+        notFound: '文件不存在，可能已被移动或删除',
+        notText: '这个文件不是文本，无法发送',
+        tooLarge: '文件太大，无法发送',
+        notRegularFile: '这不是普通文件，无法读取',
+        readFailedWithCode: '读取文件失败（{code}）',
         noFile: '这个预览没有对应文件',
         empty: '文件没有文本内容',
       },
@@ -85,10 +91,67 @@ window.__ModuleLoader__.load({
         busy: 'The input box is submitting',
         unavailable: 'File reading is unavailable',
         readFailed: 'Could not read the file',
+        notFound: 'The file is gone — it may have been moved or deleted',
+        notText: 'This file is not text, so it cannot be sent',
+        tooLarge: 'The file is too large to send',
+        notRegularFile: 'This is not a regular file',
+        readFailedWithCode: 'Could not read the file ({code})',
         noFile: 'This preview has no file behind it',
         empty: 'The file has no text content',
       },
     };
+
+    /**
+     * Host `workspace-file/*` refusal codes that can come out of a text read,
+     * keyed by their short name. The Host namespaces them (`not-text` arrives as
+     * `workspace-file/not-text`), so lookups are made against the tail.
+     */
+    const READ_ERROR_KEYS = {
+      'not-found': 'notFound',
+      'not-text': 'notText',
+      'too-large': 'tooLarge',
+      'not-regular-file': 'notRegularFile',
+    };
+
+    /**
+     * Name one read refusal the way the user needs to hear it.
+     *
+     * The Host answers every refusal with a typed code; flattening them all into
+     * "could not read" hides the one distinction that matters — a moved or
+     * deleted file is fixed by reopening the preview, while a binary file never
+     * will be sendable. An unrecognized code keeps its raw text, because a
+     * gateway or transport failure is otherwise indistinguishable from the rest.
+     * @param code - the `code` of the thrown failure.
+     * @returns the dictionary key, plus `{code}` when the code is not mapped.
+     */
+    function readFailure(code) {
+      // `readFailed` is this module's own sentinel for "no code came back".
+      if (typeof code !== 'string' || code === '' || code === 'readFailed') return { key: 'readFailed' };
+      const short = code.slice(code.lastIndexOf('/') + 1);
+      if (Object.hasOwn(READ_ERROR_KEYS, short)) return { key: READ_ERROR_KEYS[short] };
+      return { key: 'readFailedWithCode', params: { code } };
+    }
+
+    /**
+     * Turn anything thrown or returned as a failure into the most specific
+     * reason available: the Host's typed code when there is one, an exception's
+     * name and message otherwise. Collapsing every failure into one sentence
+     * hides exactly the distinction needed to act on it, and a failure that is
+     * neither should say what it was instead of guessing.
+     * @param failure - the thrown value, or a `RemoteResult`'s `error`.
+     * @returns the reason text.
+     */
+    function reasonOf(failure) {
+      if (typeof failure === 'string' && failure !== '') return failure;
+      if (failure === null || typeof failure !== 'object') return 'readFailed';
+      if (typeof failure.code === 'string' && failure.code !== '') return failure.code;
+      const name = typeof failure.name === 'string' ? failure.name : '';
+      const message = typeof failure.message === 'string' ? failure.message : '';
+      // A bare `Error` with no message says nothing; a named subclass does.
+      const named = name !== '' && name !== 'Error';
+      const text = message !== '' ? (named ? `${name}: ${message}` : message) : named ? name : '';
+      return text === '' ? 'readFailed' : text.slice(0, 120);
+    }
 
     /**
      * Fill `{name}` placeholders of one dictionary entry.
@@ -236,29 +299,55 @@ window.__ModuleLoader__.load({
 
     /**
      * Read one previewed file through the session-scoped file API.
+     *
+     * Two things about this face are easy to get wrong, and both were:
+     *
+     *   * `offset` is the **1-based** first line, and anything that is not a
+     *     positive integer is refused with `gateway/bad-request` — so the first
+     *     request asks for line 1, never line 0;
+     *   * the Client Remote resolves to a `RemoteResult` (`{ ok, value }` or
+     *     `{ ok, error }`) and does not throw for a refused read, so the failure
+     *     has to be read out of the answer rather than caught.
+     *
+     * A page's `text` joins its lines with `\n` and carries no terminator, so
+     * pages are joined with one; otherwise the last line of a page would fuse
+     * with the first line of the next.
+     *
+     * The namespace is read through `ctx.remote` rather than `ctx.get('remote')`
+     * because that is the access the injection buys: this module declares
+     * `remote.workspaceFiles` below, exactly as the shipped preview does. Reaching
+     * for it from a context that never injected it is what made every click fail
+     * with no reason attached.
      * @param ctx - Client root context.
      * @param sessionId - the session that owns the preview.
      * @param absolutePath - the file to read.
      * @returns `{ text, truncated }`, or `{ error }` when it could not be read.
      */
     async function readFileText(ctx, sessionId, absolutePath) {
-      const remote = ctx.get('remote');
+      const remote = ctx.remote;
       const files = remote === undefined ? undefined : remote.workspaceFiles;
       if (files === undefined || typeof files.read !== 'function') return { error: 'unavailable' };
       const controller = new AbortController();
       let text = '';
-      let lines = 0;
+      let offset = 1;
       try {
         for (let page = 0; page < MAX_PAGES; page += 1) {
-          const chunk = await files.read(sessionId, absolutePath, { offset: lines, limit: PAGE_LINES }, controller.signal);
+          const result = await files.read(sessionId, absolutePath, { offset }, controller.signal);
+          if (result === null || result === undefined) break;
+          if (result.ok !== true) return { error: reasonOf(result.error) };
+          const chunk = result.value;
           if (chunk === null || chunk === undefined) break;
-          text += typeof chunk.text === 'string' ? chunk.text : '';
-          lines += typeof chunk.lines === 'number' ? chunk.lines : 0;
+          const chunkText = typeof chunk.text === 'string' ? chunk.text : '';
+          if (text !== '' && chunkText !== '') text += '\n';
+          text += chunkText;
           if (chunk.eof === true || text.length >= MAX_FILE_CHARS) break;
+          const lines = typeof chunk.lines === 'number' ? chunk.lines : 0;
+          // A page that reports nothing would spin the loop on the same offset.
+          if (lines <= 0) break;
+          offset += lines;
         }
       } catch (failure) {
-        const code = failure !== null && typeof failure === 'object' ? failure.code : undefined;
-        return { error: typeof code === 'string' ? code : 'readFailed' };
+        return { error: reasonOf(failure) };
       }
       const truncated = text.length > MAX_FILE_CHARS;
       return { text: truncated ? text.slice(0, MAX_FILE_CHARS) : text, truncated };
@@ -329,8 +418,8 @@ window.__ModuleLoader__.load({
         [],
       );
 
-      const say = React.useCallback((key) => {
-        setHint(t(key));
+      const say = React.useCallback((key, params) => {
+        setHint(t(key, params));
         if (timer.current !== null) clearTimeout(timer.current);
         timer.current = setTimeout(() => setHint(''), HINT_MS);
       }, []);
@@ -378,7 +467,12 @@ window.__ModuleLoader__.load({
         }
         setReading(false);
         if (result.error !== undefined) {
-          say(result.error === 'unavailable' ? 'unavailable' : 'readFailed');
+          if (result.error === 'unavailable') {
+            say('unavailable');
+            return;
+          }
+          const { key, params } = readFailure(result.error);
+          say(key, params);
           return;
         }
         if (result.text.trim() === '') {
@@ -488,6 +582,6 @@ window.__ModuleLoader__.load({
       });
     }
 
-    return { inject: ['slots'], apply };
+    return { inject: ['slots', 'remote', 'remote.workspaceFiles'], apply };
   },
 });

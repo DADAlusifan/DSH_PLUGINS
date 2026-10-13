@@ -18,6 +18,8 @@ const styleTags = [];
 const selectionListeners = new Set();
 /** What `document.getSelection()` answers, set per test. */
 let selection = null;
+/** Every value handed to a `useState` setter, so a hint can be asserted. */
+const stateWrites = [];
 
 globalThis.window = {
   __ModuleLoader__: { load: (spec) => registered.set(spec.id, spec) },
@@ -57,7 +59,10 @@ function reactStub() {
     createElement: (...args) => ({ type: args[0], props: args[1] ?? {}, children: args.slice(2) }),
     memo: (component) => component,
     useRef: (value) => ({ current: value }),
-    useState: (initial) => [typeof initial === 'function' ? initial() : initial, () => {}],
+    useState: (initial) => [
+      typeof initial === 'function' ? initial() : initial,
+      (value) => stateWrites.push(value),
+    ],
     useEffect: (callback) => callback(),
     useCallback: (callback) => callback,
   };
@@ -109,6 +114,8 @@ function clientContext() {
       return dispose;
     },
     get: () => undefined,
+    // Set per test: the injected `remote` namespace the reader goes through.
+    remote: undefined,
     inject: (names, callback) => {
       log.injected.push(...names);
       callback(ctx);
@@ -164,14 +171,68 @@ function inputActionsDouble(accepted = true) {
   };
 }
 
+/**
+ * The last hint the component put on screen.
+ * @returns the hint text, or `undefined` when it never wrote one.
+ */
+function lastHint() {
+  const strings = stateWrites.filter((value) => typeof value === 'string' && value !== '');
+  return strings[strings.length - 1];
+}
+
+/**
+ * Click the whole-file button with a Host file API that refuses every read the
+ * way the real one does — a `RemoteResult` carrying the error, not a throw. The
+ * plugin's own reader runs, so this covers the path from the refusal through
+ * `readFileText` to the visible hint.
+ * @param code - the `code` the Host refusal carries, or `null` for no Remote face.
+ * @param thrown - an exception to throw instead, for the no-code path.
+ * @returns the hint the component last set.
+ */
+async function hintWhenReadFails(code, thrown = null) {
+  const spec = registered.get('@local/dsh-send-to-input');
+  const module = spec.factory(requireStub({ react: reactStub() }));
+  const { ctx, log } = clientContext();
+  const compose = inputActionsDouble();
+  if (code !== null || thrown !== null) {
+    ctx.remote = {
+      workspaceFiles: {
+        read: () =>
+          thrown === null ? Promise.resolve({ ok: false, error: { code } }) : Promise.reject(thrown),
+      },
+    };
+  }
+  module.apply(ctx);
+
+  const { readFile } = log.registrations[0].inject();
+  const cell = flatten(
+    log.registrations[0].component({
+      inputActions: compose,
+      sessionId: 's1',
+      absolutePath: 'D:\\ws\\note.md',
+      readFile,
+    }),
+  );
+  const buttons = cell.filter((node) => node.type === 'button');
+  stateWrites.length = 0;
+  await buttons[1].props.onClick();
+  assert.equal(compose.calls.length, 0, 'a failed read must never send a payload');
+  return lastHint();
+}
+
 test('the bundle registers itself under the package id', () => {
   assert.ok(registered.has('@local/dsh-send-to-input'), 'the module loader must receive our id');
 });
 
+
 test('the factory loads with and without the shipped primitives', () => {
   const spec = registered.get('@local/dsh-send-to-input');
   const fallback = spec.factory(requireStub({ react: reactStub() }));
-  assert.deepEqual(fallback.inject, ['slots']);
+  assert.deepEqual(
+    fallback.inject,
+    ['slots', 'remote', 'remote.workspaceFiles'],
+    'the reader goes through an injected namespace, exactly as the shipped preview does',
+  );
   assert.equal(typeof fallback.apply, 'function');
 
   const withIcons = spec.factory(
@@ -261,27 +322,32 @@ test('the header cell refuses to send the composer own text back into itself', (
   assert.equal(buttons[1].props.disabled, true, 'sending a whole file needs a file behind the preview');
 });
 
-test('the whole-file button reads through the file API until eof', async () => {
+test('the whole-file button pages with 1-based offsets and joins pages itself', async () => {
   const spec = registered.get('@local/dsh-send-to-input');
   const module = spec.factory(requireStub({ react: reactStub() }));
   const { ctx, log } = clientContext();
   const compose = inputActionsDouble();
+  // Exactly what the Host answers: a RemoteResult whose page text joins its
+  // lines with "\n" and carries no terminator after the last one.
   const pages = [
-    { text: 'a\nb\n', lines: 2, eof: false },
-    { text: 'c\n', lines: 1, eof: true },
+    { ok: true, value: { text: 'a\nb', lines: 2, eof: false } },
+    { ok: true, value: { text: 'c', lines: 1, eof: true } },
   ];
   const reads = [];
-  ctx.get = (key) =>
-    key === 'remote'
-      ? {
-          workspaceFiles: {
-            read: (sessionId, path, range, signal) => {
-              reads.push({ sessionId, path, offset: range.offset, cancellable: signal !== undefined });
-              return Promise.resolve(pages.shift());
-            },
-          },
-        }
-      : undefined;
+  ctx.remote = {
+    workspaceFiles: {
+      read: (sessionId, path, range, signal) => {
+        reads.push({
+          sessionId,
+          path,
+          offset: range.offset,
+          sendsLimit: Object.hasOwn(range, 'limit'),
+          cancellable: signal !== undefined,
+        });
+        return Promise.resolve(pages.shift());
+      },
+    },
+  };
   module.apply(ctx);
 
   // The reader reaches the component the same way the platform delivers props.
@@ -295,31 +361,77 @@ test('the whole-file button reads through the file API until eof', async () => {
   assert.deepEqual(
     reads,
     [
-      { sessionId: 's1', path: 'D:\\ws\\a.json', offset: 0, cancellable: true },
-      { sessionId: 's1', path: 'D:\\ws\\a.json', offset: 2, cancellable: true },
+      { sessionId: 's1', path: 'D:\\ws\\a.json', offset: 1, sendsLimit: false, cancellable: true },
+      { sessionId: 's1', path: 'D:\\ws\\a.json', offset: 3, sendsLimit: false, cancellable: true },
     ],
-    'pages are read until eof, advancing by the reported line count',
+    'line numbers start at 1, and the next page resumes after the lines reported',
   );
   assert.equal(compose.calls.length, 1);
   assert.ok(compose.calls[0].text.includes('```json'), 'the fence follows the file extension');
-  assert.ok(compose.calls[0].text.includes('a\nb\nc'), 'every page lands in the payload');
+  assert.ok(compose.calls[0].text.includes('a\nb\nc'), 'pages are joined with the newline the Host stripped');
 });
 
-test('a read failure is reported instead of sending a half-empty payload', async () => {
+test('a reader that throws outright still sends nothing and says the flat line', async () => {
   const spec = registered.get('@local/dsh-send-to-input');
   const module = spec.factory(requireStub({ react: reactStub() }));
   const { ctx, log } = clientContext();
   const compose = inputActionsDouble();
-  const failure = Object.assign(new Error('nope'), { code: 'not-text' });
   module.apply(ctx);
-  const readFile = () => Promise.reject(failure);
+  // A foreign reader, not the plugin's own: a transport failure never reaches
+  // this code as a RemoteResult, so the component's own guard has to hold.
+  const readFile = () => Promise.reject(Object.assign(new Error('nope'), { code: 'not-text' }));
 
   const cell = flatten(
-    log.registrations[0].component({ inputActions: compose, sessionId: 's1', absolutePath: 'D:\\ws\\a.png', readFile }),
+    log.registrations[0].component({ inputActions: compose, sessionId: 's1', absolutePath: 'D:\\ws\\a.md', readFile }),
   );
   const buttons = cell.filter((node) => node.type === 'button');
+  stateWrites.length = 0;
   await buttons[1].props.onClick();
   assert.equal(compose.calls.length, 0, 'a failed read sends nothing');
+  assert.equal(lastHint(), '读取文件失败', 'a failure with no readable code keeps the flat message');
+});
+
+test('a read failure names the real reason instead of one flat message', async () => {
+  assert.equal(
+    await hintWhenReadFails('workspace-file/not-found'),
+    '文件不存在，可能已被移动或删除',
+    'a moved or deleted preview is fixed by reopening it, and must say so',
+  );
+  assert.equal(await hintWhenReadFails('workspace-file/not-text'), '这个文件不是文本，无法发送');
+  assert.equal(await hintWhenReadFails('workspace-file/too-large'), '文件太大，无法发送');
+  assert.equal(await hintWhenReadFails('workspace-file/not-regular-file'), '这不是普通文件，无法读取');
+});
+
+test('a bare or unknown code still lands somewhere the user can act on', async () => {
+  assert.equal(
+    await hintWhenReadFails('not-text'),
+    '这个文件不是文本，无法发送',
+    'matching is on the code tail, so an unnamespaced code still resolves',
+  );
+  assert.equal(
+    await hintWhenReadFails('gateway/bad-request'),
+    '读取文件失败（gateway/bad-request）',
+    'an unmapped code keeps its text rather than hiding behind one message',
+  );
+  assert.equal(await hintWhenReadFails(null), '文件读取不可用', 'a missing Remote face is its own reason');
+});
+
+test('a failure with no Host code says what it actually was', async () => {
+  assert.equal(
+    await hintWhenReadFails(null, new TypeError('remote.workspaceFiles is undefined')),
+    '读取文件失败（TypeError: remote.workspaceFiles is undefined）',
+    'an unattributed failure must not hide behind the flat message again',
+  );
+  assert.equal(
+    await hintWhenReadFails('Bad Request'),
+    '读取文件失败（Bad Request）',
+    'a string error is a reason too',
+  );
+  assert.equal(
+    await hintWhenReadFails(null, new Error('')),
+    '读取文件失败',
+    'a nameless, messageless throw falls back to the flat line',
+  );
 });
 
 test('a reload keeps the stylesheet alive, and the last owner removes it', () => {
