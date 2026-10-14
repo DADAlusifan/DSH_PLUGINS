@@ -12,16 +12,17 @@ import path from 'node:path';
 import test from 'node:test';
 
 import {
+  API_ROUTE,
   collectNotes,
-  createHandler,
+  createFetchRoutes,
   decodeNoteBytes,
+  ENDPOINTS,
   normalizeConfig,
   readNote,
   readWorkspaces,
   resolveWorkspace,
-  ROUTE,
 } from '../lib/host.js';
-import { fakeConnection, fakeContext, fakeFs, fakeRequest, fakeResponse } from './fake-fs.js';
+import { fakeContext, fakeFs } from './fake-fs.js';
 
 const CAP = 512 * 1024;
 
@@ -214,6 +215,41 @@ test('collectNotes carries name and directory for the list rows', async (t) => {
   assert.deepEqual(listing.notes, [{ path: 'docs/guide/x.md', name: 'x.md', dir: 'docs/guide' }]);
 });
 
+test('collectNotes stops when the caller cancels, and does not report a listing', async (t) => {
+  const root = await workspace(t);
+  await put(root, 'a.md', '# a');
+  await put(root, 'deep/b.md', '# b');
+
+  // Abort lands while the first `readdir` is in flight: the walk must not
+  // finish, and the partial rows it collected must never be handed back as a
+  // complete listing.
+  const controller = new AbortController();
+  const listing = await collectNotes(
+    root,
+    normalizeConfig(),
+    async (dir, options) => {
+      controller.abort();
+      return fs.readdir(dir, options);
+    },
+    controller.signal,
+  );
+  assert.equal(listing.aborted, true, 'a cancelled walk reports itself as cancelled');
+  assert.deepEqual(listing.notes, [], 'and carries no rows the caller cancelled');
+});
+
+test('a cancelled listing answers 499 rather than a partial list', async (t) => {
+  const root = await workspace(t);
+  await put(root, 'a.md', '# a');
+  await put(root, 'deep/b.md', '# b');
+  const controller = new AbortController();
+  controller.abort();
+
+  const answer = await call(routesFor(servicesFor(root)), 'notes', 'workspace=w1', 'GET', controller.signal);
+  assert.equal(answer.status, 499);
+  assert.deepEqual(answer.json(), { error: 'aborted' });
+  assert.equal(answer.json().notes, undefined, 'no partial rows may reach the client');
+});
+
 // ------------------------------------------------------------------ config
 
 test('normalizeConfig clamps or falls back on bad input', () => {
@@ -266,16 +302,46 @@ test('resolveWorkspace accepts the durable id and the directory path, and nothin
   assert.equal(resolveWorkspace(ctx, undefined), undefined);
 });
 
-// ----------------------------------------------------------------- handler
+// ------------------------------------------------------------ fetch routes
 
 /**
- * Build a handler wired to a fake context.
+ * The Fetch routes one context exposes, keyed by endpoint.
  * @param services - services for `ctx.get`.
  * @param config - plugin config.
- * @returns the handler.
+ * @returns endpoint to route.
  */
-function handlerFor(services, config = normalizeConfig()) {
-  return createHandler(fakeContext(services), config);
+function routesFor(services, config = normalizeConfig()) {
+  const routes = createFetchRoutes(fakeContext(services), config);
+  assert.deepEqual(
+    routes.map(({ route }) => route.path),
+    ENDPOINTS.map((endpoint) => `${API_ROUTE}/${endpoint}`),
+    'every endpoint is registered on the shared channel',
+  );
+  return new Map(routes.map(({ route }) => [route.path, route]));
+}
+
+/**
+ * Call one route the way the shared channel does: the fence already admitted,
+ * the handler owns its own Response.
+ * @param routes - routes from `routesFor`.
+ * @param endpoint - endpoint name.
+ * @param query - query string, without the leading `?`.
+ * @param method - HTTP method.
+ * @param signal - caller cancellation, as the channel supplies it.
+ * @returns the status, headers, and parsed body.
+ */
+async function call(routes, endpoint, query = '', method = 'GET', signal) {
+  const route = routes.get(`${API_ROUTE}/${endpoint}`);
+  assert.ok(route !== undefined, `route for ${endpoint}`);
+  const url = query === '' ? `http://127.0.0.1:19387${route.path}` : `http://127.0.0.1:19387${route.path}?${query}`;
+  const response = await route.fetch(new Request(url, { method, ...(signal === undefined ? {} : { signal }) }));
+  const text = await response.text();
+  return {
+    status: response.status,
+    headers: response.headers,
+    text,
+    json: () => JSON.parse(text),
+  };
 }
 
 /**
@@ -286,66 +352,82 @@ function handlerFor(services, config = normalizeConfig()) {
 function servicesFor(root) {
   return {
     workspaceRegistry: { list: () => [{ id: 'w1', path: root, title: 'ws', updatedAt: '2020-01-01T00:00:00.000Z' }] },
-    connection: fakeConnection(),
     fs: fakeFs,
   };
 }
 
-test('the route refuses an unadmitted request', async (t) => {
+test('every route is an exact GET/HEAD route on the shared channel', async (t) => {
+  const root = await workspace(t);
+  const routes = routesFor(servicesFor(root));
+  for (const route of routes.values()) {
+    assert.deepEqual(route.methods, ['GET', 'HEAD'], 'the fence carries read-only methods');
+    assert.equal(route.requestBody, 'buffered');
+    assert.equal(typeof route.fetch, 'function');
+    // The registry validates a route path with the same rule the shared channel
+    // resolves endpoints by: it must sit below `/api` and every segment must be
+    // a plain token. A path that fails this throws at load, so assert it here.
+    assert.ok(route.path.startsWith('/api/'), 'a shared-channel route lives below /api');
+    for (const segment of route.path.slice('/api/'.length).split('/')) {
+      assert.match(segment, /^[A-Za-z0-9_$.-]+$/, `segment ${JSON.stringify(segment)} must be a plain token`);
+    }
+  }
+});
+
+test('the routes carry no admission logic of their own', async (t) => {
+  // The shared channel admits before dispatch, so a route must answer even
+  // without a `connection` service in the context: the fence is not the
+  // handler's job. A regression here would mean the plugin quietly re-added a
+  // private gate that the `connection/request` waterfall cannot see.
   const root = await workspace(t);
   await put(root, 'a.md', '# a');
-  const res = fakeResponse();
-  await handlerFor(servicesFor(root))(fakeRequest({ url: `${ROUTE}/state`, admitted: false }), res);
-  assert.equal(res.statusCode, 403);
-  assert.deepEqual(res.json(), { error: 'unauthorized' });
+  const routes = routesFor({ workspaceRegistry: { list: () => [] }, fs: fakeFs });
+  const answer = await call(routes, 'state');
+  assert.equal(answer.status, 200, 'no private gate may refuse an already-admitted request');
 });
 
-test('the route refuses to serve at all without the connection fence', async (t) => {
+test('the routes answer endpoint errors and declare only read methods', async (t) => {
   const root = await workspace(t);
-  const res = fakeResponse();
-  await handlerFor({ workspaceRegistry: { list: () => [] }, fs: fakeFs })(fakeRequest({ url: `${ROUTE}/state` }), res);
-  assert.equal(res.statusCode, 503);
-});
+  const routes = routesFor(servicesFor(root));
 
-test('the route answers method and endpoint errors', async (t) => {
-  const root = await workspace(t);
-  const handler = handlerFor(servicesFor(root));
+  // A non-GET/HEAD request never reaches a handler: the shared channel only
+  // dispatches the methods a route declares, then falls through to its own
+  // RPC dispatch. The declaration is therefore the method gate.
+  for (const route of routes.values()) {
+    assert.deepEqual(route.methods, ['GET', 'HEAD'], 'a write method must stay unowned');
+  }
 
-  const posted = fakeResponse();
-  await handler(fakeRequest({ method: 'POST', url: `${ROUTE}/state` }), posted);
-  assert.equal(posted.statusCode, 405);
-
-  const unknown = fakeResponse();
-  await handler(fakeRequest({ url: `${ROUTE}/nope` }), unknown);
-  assert.equal(unknown.statusCode, 404);
-
-  const badWorkspace = fakeResponse();
-  await handler(fakeRequest({ url: `${ROUTE}/notes?workspace=nope` }), badWorkspace);
-  assert.equal(badWorkspace.statusCode, 404);
+  const badWorkspace = await call(routes, 'notes', 'workspace=nope');
+  assert.equal(badWorkspace.status, 404);
   assert.deepEqual(badWorkspace.json(), { error: 'unknown-workspace' });
 });
 
 test('the state endpoint reports the registry order and the route', async (t) => {
   const root = await workspace(t);
-  const res = fakeResponse();
-  await handlerFor(servicesFor(root))(fakeRequest({ url: `${ROUTE}/state` }), res);
-  assert.equal(res.statusCode, 200);
-  const body = res.json();
+  const answer = await call(routesFor(servicesFor(root)), 'state');
+  assert.equal(answer.status, 200);
+  const body = answer.json();
   assert.equal(body.defaultKey, 'w1');
   assert.equal(body.order, 'registry');
-  assert.equal(body.route, ROUTE);
-  assert.equal(res.headers['cache-control'], 'no-store');
-  assert.equal(res.headers['x-content-type-options'], 'nosniff');
+  assert.equal(body.route, `${API_ROUTE}/state`);
+  assert.equal(answer.headers.get('cache-control'), 'no-store');
+  assert.equal(answer.headers.get('x-content-type-options'), 'nosniff');
+});
+
+test('a HEAD answer carries the headers but no body', async (t) => {
+  const root = await workspace(t);
+  const answer = await call(routesFor(servicesFor(root)), 'state', '', 'HEAD');
+  assert.equal(answer.status, 200);
+  assert.equal(answer.text, '', 'a HEAD response must not carry a body');
+  assert.ok(Number(answer.headers.get('content-length')) > 0, 'and still advertises the length a GET would send');
 });
 
 test('the notes and note endpoints serve the workspace and refuse an escape', async (t) => {
   const root = await workspace(t);
   await put(root, 'notes/a.md', '# a');
-  const handler = handlerFor(servicesFor(root));
+  const routes = routesFor(servicesFor(root));
 
-  const list = fakeResponse();
-  await handler(fakeRequest({ url: `${ROUTE}/notes?workspace=w1` }), list);
-  assert.equal(list.statusCode, 200);
+  const list = await call(routes, 'notes', 'workspace=w1');
+  assert.equal(list.status, 200);
   assert.deepEqual(
     list.json().notes.map((note) => note.path),
     ['notes/a.md'],
@@ -353,14 +435,12 @@ test('the notes and note endpoints serve the workspace and refuse an escape', as
   assert.equal(list.json().limit, 800);
   assert.equal(list.json().workspace, 'w1');
 
-  const note = fakeResponse();
-  await handler(fakeRequest({ url: `${ROUTE}/note?workspace=w1&path=${encodeURIComponent('notes/a.md')}` }), note);
-  assert.equal(note.statusCode, 200);
+  const note = await call(routes, 'note', `workspace=w1&path=${encodeURIComponent('notes/a.md')}`);
+  assert.equal(note.status, 200);
   assert.equal(note.json().text, '# a');
 
-  const escape = fakeResponse();
-  await handler(fakeRequest({ url: `${ROUTE}/note?workspace=w1&path=${encodeURIComponent('../../secret.md')}` }), escape);
-  assert.equal(escape.statusCode, 400);
+  const escape = await call(routes, 'note', `workspace=w1&path=${encodeURIComponent('../../secret.md')}`);
+  assert.equal(escape.status, 400);
   assert.equal(escape.json().error, 'outside-workspace');
 });
 
@@ -374,11 +454,7 @@ test('the 500 body never echoes the internal message', async (t) => {
       throw new Error('C:\\Users\\operator\\secret\\path');
     },
   };
-  const res = fakeResponse();
-  await handlerFor({ ...servicesFor(root), fs: boobyTrapped })(
-    fakeRequest({ url: `${ROUTE}/note?workspace=w1&path=a.md` }),
-    res,
-  );
-  assert.equal(res.statusCode, 404, 'a resolve failure is reported as not-found');
-  assert.ok(!res.body.includes('operator'), 'no host path may leak to the client');
+  const answer = await call(routesFor({ ...servicesFor(root), fs: boobyTrapped }), 'note', 'workspace=w1&path=a.md');
+  assert.equal(answer.status, 404, 'a resolve failure is reported as not-found');
+  assert.ok(!answer.text.includes('operator'), 'no host path may leak to the client');
 });

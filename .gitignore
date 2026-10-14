@@ -23,3 +23,9 @@ Thumbs.db
 
 # Git 恢复备份（ACL 修复脚本产物，不进仓）
 acl-backup-*.json
+
+# DSH 官方源码（只读参考，不属于本仓库；带了 .git，提交会变成 gitlink）
+deepseek-harness/
+
+# 第三方插件源码/发布产物（安全审查用，只读参考）
+third-party-src/

@@ -1,19 +1,21 @@
 /**
  * @local/dsh-project-notes — Host logic.
  *
- * Everything the plugin's HTTP route needs, kept out of the entry point so it
- * can be unit-tested without a running Harness:
+ * Everything the plugin's API needs, kept out of the entry point so it can be
+ * unit-tested without a running Harness:
  *
- *   * `normalizeConfig`   — validate the optional plugin config;
- *   * `readWorkspaces`    — project the durable workspace registry;
- *   * `resolveWorkspace`  — accept a workspace id or path, never anything else;
- *   * `collectNotes`      — walk one workspace for Markdown files;
- *   * `readNote`          — read one note through the Host `fs` service;
- *   * `createHandler`     — the admission gate plus the three endpoints.
+ *   * `normalizeConfig`    — validate the optional plugin config;
+ *   * `readWorkspaces`     — project the durable workspace registry;
+ *   * `resolveWorkspace`   — accept a workspace id or path, never anything else;
+ *   * `collectNotes`       — walk one workspace for Markdown files;
+ *   * `readNote`           — read one note through the Host `fs` service;
+ *   * `answerRequest`      — the three endpoints, carrier-independent;
+ *   * `createFetchRoutes`  — those endpoints as exact `/api` Fetch routes.
  *
  * Security posture (mirrors the shipped `workspaceFiles` service):
- *   * the route is gated by `ctx.connection.admit(req)` — a `webServer` route
- *     is otherwise reachable by anything that can open the port;
+ *   * the routes live on the shared `/api` channel, so the connection fence
+ *     (Host/Origin plus browser authentication) admits every request before any
+ *     handler runs — the plugin holds no admission logic of its own;
  *   * containment is `ctx.fs.resolve()` + `ctx.fs.contains()`, which compare
  *     realpath-derived target keys and so defeat `..` and symlinks alike;
  *   * a final symlink is refused outright, as the platform's own file reads do;
@@ -22,8 +24,12 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 
-/** Route prefix owned by this plugin. */
-export const ROUTE = '/project-notes/api';
+/**
+ * The endpoints on the shared authenticated `/api` channel. The connection
+ * fence admits every request before dispatch, which is why this plugin carries
+ * no admission logic.
+ */
+export const API_ROUTE = '/api/project-notes';
 
 /** Built-in bounds, each overridable through the plugin's optional config. */
 export const DEFAULT_CONFIG = {
@@ -177,13 +183,15 @@ export function resolveWorkspace(ctx, key) {
  * @param root - absolute workspace root.
  * @param config - the resolved configuration.
  * @param readdir - injectable directory reader, for tests.
+ * @param signal - caller cancellation, checked between directories.
  * @returns relative note rows and whether a cap cut the listing.
  */
-export async function collectNotes(root, config, readdir = fs.readdir) {
+export async function collectNotes(root, config, readdir = fs.readdir, signal) {
   const notes = [];
   let truncated = false;
   const queue = [{ dir: root, depth: 0 }];
   for (let head = 0; head < queue.length; head += 1) {
+    if (signal?.aborted === true) return { notes, truncated, aborted: true };
     const current = queue[head];
     let entries;
     try {
@@ -191,9 +199,12 @@ export async function collectNotes(root, config, readdir = fs.readdir) {
     } catch {
       continue;
     }
+    // The await is the long pole: re-check before doing any work with its result.
+    if (signal?.aborted === true) return { notes, truncated, aborted: true };
     entries.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
     let capped = false;
     for (const entry of entries) {
+      if (signal?.aborted === true) return { notes, truncated, aborted: true };
       if (notes.length >= config.maxNotes) {
         capped = true;
         break;
@@ -324,109 +335,109 @@ export async function readNote(fsService, root, relative, config, signal) {
   };
 }
 
-/**
- * Answer one request with JSON.
- * @param res - the node response.
- * @param status - HTTP status code.
- * @param body - JSON-serializable body.
- */
-function sendJson(res, status, body) {
-  const text = JSON.stringify(body);
-  res.writeHead(status, {
-    'content-type': 'application/json; charset=utf-8',
-    'cache-control': 'no-store',
-    'x-content-type-options': 'nosniff',
-    'content-length': Buffer.byteLength(text),
-  });
-  res.end(text);
-}
+/** Response headers every answer carries. */
+const RESPONSE_HEADERS = {
+  'content-type': 'application/json; charset=utf-8',
+  'cache-control': 'no-store',
+  'x-content-type-options': 'nosniff',
+};
+
+/** The endpoints the shared channel serves, in registration order. */
+export const ENDPOINTS = ['state', 'notes', 'note'];
 
 /**
- * The admission status the connection fence reports for one request.
- *
- * A `webServer` route is not covered by the carrier: the shipped `/api`
- * channel enforces its own Host/Origin fence and browser authentication, and a
- * plugin route must do the same. Without the service the route refuses to
- * answer at all rather than serving unauthenticated file reads.
- * @param ctx - Host plugin context.
- * @param req - the node request.
- * @returns the rejection status, or undefined when the request is admitted.
- */
-function admissionStatus(ctx, req) {
-  const connection = ctx?.get?.('connection');
-  if (connection === undefined || typeof connection.admit !== 'function') return 503;
-  try {
-    const admission = connection.admit(req);
-    return admission !== null && typeof admission === 'object' && 'rejection' in admission
-      ? admission.rejection
-      : undefined;
-  } catch {
-    return 403;
-  }
-}
-
-/**
- * Build the request handler for the plugin's route prefix.
+ * Answer one endpoint. The shared `/api` Fetch routes call this after the
+ * connection fence admitted the request, so the endpoints, their bounds, and
+ * their error vocabulary live in exactly one place.
  * @param ctx - Host plugin context.
  * @param config - the resolved configuration.
- * @returns a node:http handler owning the full response.
+ * @param endpoint - one of `ENDPOINTS`.
+ * @param params - request query parameters.
+ * @param signal - caller cancellation, when the carrier supplies one.
+ * @returns the status and JSON-serializable body.
  */
-export function createHandler(ctx, config) {
-  return async (req, res) => {
-    try {
-      const rejection = admissionStatus(ctx, req);
-      if (rejection !== undefined) {
-        sendJson(res, rejection, { error: rejection === 503 ? 'internal' : 'unauthorized' });
-        return;
-      }
-      if (req.method !== 'GET' && req.method !== 'HEAD') {
-        sendJson(res, 405, { error: 'method-not-allowed' });
-        return;
-      }
-      const fsService = ctx?.get?.('fs');
-      if (fsService === undefined || typeof fsService.readByteRange !== 'function') {
-        sendJson(res, 503, { error: 'internal' });
-        return;
-      }
+export async function answerRequest(ctx, config, endpoint, params, signal) {
+  const fsService = ctx?.get?.('fs');
+  if (fsService === undefined || typeof fsService.readByteRange !== 'function') {
+    return { status: 503, body: { error: 'internal' } };
+  }
 
-      const url = new URL(req.url ?? '/', 'http://localhost');
-      const endpoint = url.pathname.slice(ROUTE.length).replace(/^\/+|\/+$/g, '');
+  if (endpoint === 'state') {
+    return { status: 200, body: { ...readWorkspaces(ctx), order: 'registry', route: `${API_ROUTE}/state` } };
+  }
 
-      if (endpoint === '' || endpoint === 'state') {
-        sendJson(res, 200, { ...readWorkspaces(ctx), order: 'registry', route: ROUTE });
-        return;
-      }
+  if (endpoint === 'notes' || endpoint === 'note') {
+    const workspace = resolveWorkspace(ctx, params.get('workspace') ?? '');
+    if (workspace === undefined) return { status: 404, body: { error: 'unknown-workspace' } };
+    const root = workspace.path;
+    const id = typeof workspace.id === 'string' ? workspace.id : root;
 
-      if (endpoint === 'notes' || endpoint === 'note') {
-        const workspace = resolveWorkspace(ctx, url.searchParams.get('workspace') ?? '');
-        if (workspace === undefined) {
-          sendJson(res, 404, { error: 'unknown-workspace' });
-          return;
-        }
-        const root = workspace.path;
-        const id = typeof workspace.id === 'string' ? workspace.id : root;
-
-        if (endpoint === 'notes') {
-          const listing = await collectNotes(root, config);
-          sendJson(res, 200, { workspace: id, root, ...listing, limit: config.maxNotes });
-          return;
-        }
-
-        const note = await readNote(fsService, root, url.searchParams.get('path') ?? '', config, undefined);
-        if (note.error !== undefined) {
-          sendJson(res, STATUS[note.error] ?? 400, note);
-          return;
-        }
-        sendJson(res, 200, note);
-        return;
-      }
-
-      sendJson(res, 404, { error: 'unknown-endpoint' });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      ctx?.logger?.warn?.(new Error(`project-notes: ${message}`));
-      if (!res.headersSent) sendJson(res, 500, { error: 'internal' });
-      else res.destroy();
+    if (endpoint === 'notes') {
+      const listing = await collectNotes(root, config, undefined, signal);
+      // A walk cut short by the caller is not a listing: report it as cancelled
+      // rather than answering with the partial rows it happened to collect.
+      if (listing.aborted === true) return { status: 499, body: { error: 'aborted' } };
+      return {
+        status: 200,
+        body: { workspace: id, root, notes: listing.notes, truncated: listing.truncated, limit: config.maxNotes },
+      };
     }
-  };
+
+    const note = await readNote(fsService, root, params.get('path') ?? '', config, signal);
+    if (note.error !== undefined) return { status: STATUS[note.error] ?? 400, body: note };
+    return { status: 200, body: note };
+  }
+
+  return { status: 404, body: { error: 'unknown-endpoint' } };
+}
+
+/**
+ * The exact Fetch routes the shared `/api` channel owns for this plugin.
+ *
+ * The channel applies Connection's Host/Origin fence and browser
+ * authentication before any of them runs, so none carries admission logic of
+ * its own — exactly as the shipped `/api/file` route does. Registering here
+ * also puts the plugin's traffic through the `connection/request` waterfall,
+ * which a private `webServer` route bypasses.
+ * @param ctx - Host plugin context.
+ * @param config - the resolved configuration.
+ * @returns one Fetch route per endpoint, with its label for effect diagnostics.
+ */
+export function createFetchRoutes(ctx, config) {
+  return ENDPOINTS.map((endpoint) => ({
+    label: `project-notes: GET /api/project-notes/${endpoint}`,
+    route: {
+      path: `${API_ROUTE}/${endpoint}`,
+      methods: ['GET', 'HEAD'],
+      requestBody: 'buffered',
+      fetch: async (request) => {
+        const head = request.method === 'HEAD';
+        const url = new URL(request.url);
+        let answer;
+        try {
+          answer = await answerRequest(ctx, config, endpoint, url.searchParams, request.signal);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          ctx?.logger?.warn?.(new Error(`project-notes: ${message}`));
+          answer = { status: 500, body: { error: 'internal' } };
+        }
+        return jsonResponse(answer.status, answer.body, head);
+      },
+    },
+  }));
+}
+
+/**
+ * One JSON response; a HEAD request carries the headers but no body.
+ * @param status - HTTP status.
+ * @param body - JSON-serializable body.
+ * @param head - whether the request was a HEAD.
+ * @returns the response.
+ */
+function jsonResponse(status, body, head) {
+  const text = JSON.stringify(body);
+  return new Response(head ? null : text, {
+    status,
+    headers: { ...RESPONSE_HEADERS, 'content-length': String(Buffer.byteLength(text)) },
+  });
 }

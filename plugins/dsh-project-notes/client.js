@@ -9,7 +9,9 @@
  *     current workspace on the left, the selected note previewed on the right.
  *
  * The panel reads its data from the Host half over the same origin
- * (`/project-notes/api/...`), which is gated by the Host's connection fence.
+ * (`/api/project-notes/...`): exact routes on the shared authenticated `/api`
+ * channel, so the connection fence admits every request. The workspace list is
+ * not a request at all — the `main` slot's `useWorkspaces` seat supplies it.
  *
  * Markdown is rendered by the shipped `MarkdownText` primitive when the module
  * table exposes it (the web shell always loads `@deepseek-ai/dsh-client-ui-primitives`),
@@ -37,8 +39,8 @@ window.__ModuleLoader__.load({
     const PANEL_ID = 'project-notes';
     /** Locale namespace for the panel's visible text. */
     const NS = 'projectNotes';
-    /** Host API prefix registered by this package's node half. */
-    const API = '/project-notes/api';
+    /** Host API prefix: exact routes on the shared authenticated `/api` channel. */
+    const API = '/api/project-notes';
     /** Id of this panel's injected stylesheet. */
     const STYLE_ID = 'dsh-project-notes-style';
     /** Give up on a stalled request rather than showing a spinner forever. */
@@ -117,6 +119,17 @@ window.__ModuleLoader__.load({
     };
 
     /**
+     * Markdown chrome copy, keyed by the framework's shared `common`
+     * vocabulary. These are deliberately NOT part of `DICT`: a bound locale
+     * resolves them from the shipped `common` namespace (and any language pack
+     * that overrides it), and this map only backs the no-locale-service path.
+     */
+    const CHROME = {
+      zh: { copy: '复制', copied: '复制成功', 'codeBlock.title': '代码块', 'codeBlock.wrap': '自动换行', 'codeBlock.unwrap': '取消自动换行', 'markdown.footnotes': '脚注' },
+      en: { copy: 'Copy', copied: 'Copied', 'codeBlock.title': 'Code block', 'codeBlock.wrap': 'Wrap lines', 'codeBlock.unwrap': 'Do not wrap lines', 'markdown.footnotes': 'Footnotes' },
+    };
+
+    /**
      * Fill `{name}` placeholders in one template.
      * @param template - the dictionary entry.
      * @param params - placeholder values.
@@ -128,7 +141,7 @@ window.__ModuleLoader__.load({
     }
 
     /** Visible text lookup; rebound to the locale service during `apply`. */
-    let t = (key, params) => interpolate(DICT.zh[key] ?? key, params);
+    let t = (key, params) => interpolate(DICT.zh[key] ?? CHROME.zh[key] ?? key, params);
 
     // --------------------------------------------------------------- styles
     const CSS = `
@@ -521,6 +534,36 @@ window.__ModuleLoader__.load({
     }
 
     // ------------------------------------------------------------- markdown
+    /** Last labels object and the copy key that produced it. */
+    const labelsCache = { key: null, value: null };
+
+    /**
+     * The `MarkdownText` chrome for the active locale.
+     *
+     * The identity is stable while the resolved copy is unchanged: the renderer
+     * memoizes on `labels`, so a fresh object per render would rebuild its
+     * component table. The cache key is the resolved copy itself, so a locale
+     * switch (or a late dictionary) mints exactly one new object.
+     * @returns labels for code fences and footnotes.
+     */
+    function markdownLabels() {
+      const copyLabel = t('copy');
+      const copiedLabel = t('copied');
+      const codeLabel = t('codeBlock.title');
+      const wrapLabel = t('codeBlock.wrap');
+      const unwrapLabel = t('codeBlock.unwrap');
+      const footnotes = t('markdown.footnotes');
+      const key = [copyLabel, copiedLabel, codeLabel, wrapLabel, unwrapLabel, footnotes].join('\u0000');
+      if (labelsCache.key !== key) {
+        labelsCache.key = key;
+        labelsCache.value = {
+          code: { copyLabel, copiedLabel, toolbarLabels: { codeLabel, wrapLabel, unwrapLabel } },
+          footnotes,
+        };
+      }
+      return labelsCache.value;
+    }
+
     const INLINE = /(`[^`]+`|\*\*[^*]+\*\*|__[^_]+__|\*[^*\n]+\*|_[^_\n]+_|~~[^~]+~~|\[[^\]]*\]\([^)\s]*\))/g;
 
     /**
@@ -844,13 +887,11 @@ window.__ModuleLoader__.load({
     const remembered = { workspace: null, path: null, filter: '', outline: true };
 
     /** The `main` panel: note list plus Markdown preview. */
-    function NotesPanel() {
-      const [phase, setPhase] = React.useState('loading');
-      const [error, setError] = React.useState(null);
-      const [workspaces, setWorkspaces] = React.useState([]);
+    function NotesPanel({ useWorkspaces }) {
       const [workspace, setWorkspace] = React.useState(remembered.workspace);
       const [notes, setNotes] = React.useState([]);
       const [listPhase, setListPhase] = React.useState('loading');
+      const [listError, setListError] = React.useState(null);
       const [listLimit, setListLimit] = React.useState(null);
       const [listTruncated, setListTruncated] = React.useState(false);
       const [filter, setFilter] = React.useState(remembered.filter);
@@ -879,39 +920,50 @@ window.__ModuleLoader__.load({
         remembered.workspace = workspace;
       }, [workspace]);
 
+      // The workspace list is framework data, not ours to fetch: the `main`
+      // slot's `useWorkspaces` seat carries the live registry projection in its
+      // own display order, so a rename, a reorder, an add, or a removal lands
+      // here without a request and without a stale dropdown. Each row's
+      // `workspaceId` is the same durable id the Host registry accepts.
+      const workspaceSnapshot = useWorkspaces((state) => state);
+      const workspaces = React.useMemo(
+        () =>
+          workspaceSnapshot.items.map((row) => ({
+            key: String(row.workspaceId),
+            title: typeof row.title === 'string' && row.title !== '' ? row.title : String(row.path ?? ''),
+            path: row.path,
+          })),
+        [workspaceSnapshot.items],
+      );
+
+      // Selection follows the registry: keep the remembered workspace while it
+      // still exists, otherwise take the first registered one.
       React.useEffect(() => {
-        const controller = new AbortController();
-        setPhase('loading');
-        setError(null);
-        api('/state', null, controller.signal)
-          .then((body) => {
-            if (controller.signal.aborted) return;
-            const list = Array.isArray(body.workspaces) ? body.workspaces : [];
-            setWorkspaces(list);
-            setWorkspace((current) => {
-              if (current !== null && list.some((row) => row.key === current)) return current;
-              return typeof body.defaultKey === 'string' ? body.defaultKey : null;
-            });
-            setPhase(list.length === 0 ? 'empty' : 'ready');
-          })
-          .catch((failure) => {
-            if (controller.signal.aborted) return;
-            setError(messageOf(failure));
-            setPhase('error');
-          });
-        return () => controller.abort();
-      }, [tick]);
+        setWorkspace((current) => {
+          if (current !== null && workspaces.some((row) => row.key === current)) return current;
+          return workspaces.length === 0 ? null : workspaces[0].key;
+        });
+      }, [workspaces]);
+
+      // Derived, not synced: the snapshot is the authority on whether the
+      // registry is still loading, empty, or failed.
+      const phase =
+        workspaceSnapshot.phase !== 'ready'
+          ? workspaceSnapshot.state === 'error' ? 'error' : 'loading'
+          : workspaces.length === 0 ? 'empty' : 'ready';
 
       React.useEffect(() => {
         if (workspace === null) {
           setNotes([]);
           setListLimit(null);
           setListTruncated(false);
+          setListError(null);
           setListPhase('ready');
           return undefined;
         }
         const controller = new AbortController();
         setListPhase('loading');
+        setListError(null);
         api('/notes', { workspace }, controller.signal)
           .then((body) => {
             if (controller.signal.aborted) return;
@@ -919,6 +971,7 @@ window.__ModuleLoader__.load({
             setNotes(rows);
             setListLimit(typeof body.limit === 'number' ? body.limit : null);
             setListTruncated(body.truncated === true);
+            setListError(null);
             setListPhase('ready');
             setSelected((current) => (current !== null && rows.some((row) => row.path === current) ? current : null));
           })
@@ -927,8 +980,11 @@ window.__ModuleLoader__.load({
             setNotes([]);
             setListLimit(null);
             setListTruncated(false);
+            // The listing carries its own failure text, so an empty `notes`
+            // cannot fall through to the `noNotes` arm below and claim the
+            // workspace holds no notes when the walk never ran.
+            setListError(messageOf(failure));
             setListPhase('error');
-            setError(messageOf(failure));
           });
         return () => controller.abort();
       }, [workspace, tick]);
@@ -961,6 +1017,8 @@ window.__ModuleLoader__.load({
 
       const noteText = note !== null && typeof note.text === 'string' ? note.text : null;
       const outline = React.useMemo(() => parseOutline(noteText ?? ''), [noteText]);
+      /** Chrome copy for the shipped renderer; stable while the locale holds. */
+      const labels = markdownLabels();
 
       /**
        * Scroll one rendered heading into view.
@@ -1073,9 +1131,13 @@ window.__ModuleLoader__.load({
         if (noteText === null) return null;
         if (MarkdownText === null) return renderMarkdown(noteText);
         const name = selected === null ? '' : selected.slice(selected.lastIndexOf('/') + 1);
-        const body = h(MarkdownText, { text: transformAnchors(noteText, outline, name), variant: 'body' });
+        const body = h(MarkdownText, {
+          text: transformAnchors(noteText, outline, name),
+          labels,
+          variant: 'body',
+        });
         return MarkdownDelegateProvider === null ? body : h(MarkdownDelegateProvider, { openFile: openRelated }, body);
-      }, [noteText, outline, selected, openRelated]);
+      }, [noteText, outline, selected, openRelated, labels]);
 
       const needle = deferredFilter.trim().toLowerCase();
       const shown = needle === '' ? notes : notes.filter((row) => row.path.toLowerCase().includes(needle));
@@ -1197,14 +1259,25 @@ window.__ModuleLoader__.load({
 
       let listBody;
       if (phase === 'error') {
+        // The workspace projection carries no message of its own; the panel can
+        // only report that the registry is unavailable.
         listBody = h(
           'div',
           { className: 'dsh-pn-message dsh-pn-error' },
-          error ?? t('loadFailed'),
+          t('loadFailed'),
           h('div', { style: { marginTop: 10 } }, h(IconButton, { label: t('retry'), onClick: reload })),
         );
       } else if (phase === 'empty') {
         listBody = h('div', { className: 'dsh-pn-message' }, t('noWorkspace'));
+      } else if (listPhase === 'error') {
+        // Without this arm an empty `notes` falls through to `noNotes`, telling
+        // the user the workspace holds no notes when the listing never ran.
+        listBody = h(
+          'div',
+          { className: 'dsh-pn-message dsh-pn-error' },
+          listError ?? t('loadFailed'),
+          h('div', { style: { marginTop: 10 } }, h(IconButton, { label: t('retry'), onClick: reload })),
+        );
       } else if (listPhase === 'loading' && notes.length === 0) {
         listBody = h('div', { className: 'dsh-pn-message' }, t('loading'));
       } else if (shown.length === 0) {

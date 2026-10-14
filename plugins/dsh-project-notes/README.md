@@ -15,7 +15,11 @@ Markdown 文件，点击后在主面板中预览内容。
   清空筛选回到树。
 - **内容预览** —— 优先使用 DSH 自带的 `@deepseek-ai/dsh-client-ui-primitives` 的
   `MarkdownText`（GFM、TeX 数学、代码高亮），模块表里没有时才退回包内自带的
-  渲染器。两者都不用 `dangerouslySetInnerHTML`。
+  渲染器。两者都不用 `dangerouslySetInnerHTML`。`MarkdownText` 的 `labels`
+  是必填项（代码围栏的复制按钮、脚注标题都取自它），所以插件按当前 locale
+  组装一份并在文案不变时复用同一个对象——`MarkdownText` 以 `labels` 的引用做
+  memo，每次渲染新建对象会重建它的组件表。这几个键属于框架 `common` 命名空间
+  的公共词表，因此走 `locale.bind` 时由语言包解析，包内只保留无 locale 服务时的兜底。
 - **笔记间跳转** —— 预览里的 `[另一篇](./other.md)` 会在面板内打开对应笔记
   （通过 `MarkdownDelegateProvider` 的 `openFile` 委托；本地链接在没有委托时是
   纯文本，不会误触发页面跳转）。
@@ -26,8 +30,12 @@ Markdown 文件，点击后在主面板中预览内容。
   收到的行号滚回去；代码围栏与行内代码里的同样文本不会被改写，指向不存在的标题时
   保持原样（仍是纯文本，不会变成点了没反应的控件）。锚点匹配兼容 `#安装`、
   `#安装-1`（重复标题）与百分号编码，标题文本里的行内标记也会被归一化。
-- **工作区切换** —— 默认取工作区注册表的**注册顺序**（也就是侧栏顺序）第一条；
-  注册了多个工作区时，标题栏会出现下拉框可切换。
+- **工作区切换** —— 工作区列表来自 `useWorkspaces` 标准 prop（按注册表顺序，也就是
+  侧栏顺序）；记忆的选择仍然存在时保留它，否则回到第一条。注册了多个工作区时，
+  标题栏会出现下拉框可切换；重命名、重排、增删都会就地跟随，不需要刷新。
+- **失败可见** —— 文件列表、单篇读取、工作区投影各自持有自己的失败状态：列表遍历
+  失败时显示失败原因和「重试」，**不会**被误报成「当前工作区没有 Markdown 文件」；
+  工作区注册表为空与注册表读取失败也是两条不同的分支。
 - **主题跟随** —— 所有颜色来自 `--dsw-alias-*` 主题变量，样式集中在插件自己注入的
   一张 `<style>` 里，因此自动适配浅色/深色主题，hover/focus/选中态交给 CSS。
 
@@ -37,30 +45,40 @@ Markdown 文件，点击后在主面板中预览内容。
 |---|---|
 | `package.json` | 包清单：`dsh.bundle.patch` 声明 bundle，`dsh.client` 声明浏览器端，`exports["./client"]` 指向浏览器产物，`npm test` 跑 Host 单测 |
 | `cordis.patch.yml` | bundle 补丁：插入一行 `project-notes` 挂载本包 |
-| `index.js` | Host 半入口：声明 `inject`、把路由挂到 `ctx.webServer` |
-| `lib/host.js` | Host 半逻辑：配置校验、工作区解析、目录遍历、单文件读取、请求处理（可单测） |
+| `index.js` | Host 半入口：声明 `inject`、把三个端点注册成 `ctx.connection.fetch` 的精确路由 |
+| `lib/host.js` | Host 半逻辑：配置校验、工作区解析、目录遍历、单文件读取、端点应答（可单测） |
 | `client.js` | 浏览器半：`window.__ModuleLoader__.load({ id, factory })`，注册侧栏入口与主面板 |
-| `test/` | `node:test` 回归用例（软链逃逸、越界、截断、鉴权等） |
+| `test/host.test.js` | Host 半回归用例（软链逃逸、越界、截断、鉴权等） |
+| `test/client.test.js` | 浏览器半接线用例（模块 id、槽位注册、样式归属、locale 绑定） |
+| `test/client-panel.test.js` | 浏览器半行为用例：真跑面板组件（带依赖比较的 hook 运行时 + 假 fetch），覆盖 `MarkdownText` 必填 props 与列表失败态 |
 | `README.md` | 本文件 |
 
 ## 数据流
 
-浏览器半通过同源 `fetch` 调用 Host 半注册的接口：
+工作区列表**不走请求**：`main` 槽位的标准 prop `useWorkspaces` 已经把注册表投影
+（`items` 按侧栏顺序、`workspaceId` 就是持久 id）交给面板，重命名/重排/增删都会
+自动跟随，因此不需要 `/state` 往返，也不会出现陈旧的下拉框。面板只调用自己拥有的
+两个端点：
 
 | 接口 | 返回 |
 |---|---|
-| `GET /project-notes/api/state` | `{ workspaces, defaultKey, order, route }`，工作区按注册表顺序 |
-| `GET /project-notes/api/notes?workspace=<id\|路径>` | `{ workspace, root, notes, truncated, limit }` |
-| `GET /project-notes/api/note?workspace=<id\|路径>&path=<相对路径>` | `{ path, name, text, size, truncated, limitBytes }` |
+| `GET /api/project-notes/notes?workspace=<id\|路径>` | `{ workspace, root, notes, truncated, limit }` |
+| `GET /api/project-notes/note?workspace=<id\|路径>&path=<相对路径>` | `{ path, name, text, size, truncated, limitBytes }` |
+
+（`GET /api/project-notes/state` 仍在 Host 上提供，用于诊断与兼容，
+但浏览器半不再调用它。）
 
 `workspace` 参数同时接受工作区的持久 id 和目录路径。列表行只有 `path`/`name`/`dir`
 —— 遍历不再对每个文件 `stat`，体积随打开笔记的响应一起返回。
 
 ### 安全模型
 
-- **鉴权**：路由不是载体自带的受信通道，因此每个请求先过
-  `ctx.connection.admit(req)`（与官方 `/api` 通道同一道 Host/Origin 围栏 +
-  浏览器鉴权）。取不到 `connection` 服务时直接 503，**不会**以未鉴权方式提供服务。
+- **鉴权**：三个端点是 `/api` 共享通道上的**精确 Fetch 路由**
+  （`ctx.connection.fetch.register`），连接围栏在分发前就完成 Host/Origin 校验与
+  浏览器鉴权，因此插件自己**没有任何准入逻辑**——与官方 `/api/file` 同一条路。
+  副作用是插件流量会经过 `connection/request` waterfall（自建 `webServer` 路由
+  会绕过它）。取不到 `connection` 服务时插件根本不会加载（`inject` 声明），
+  不存在“以未鉴权方式提供服务”的分支。
 - **包含判定**：只列/只读**工作区注册表**里登记的目录；路径经
   `ctx.fs.resolve()` 解析后用 `ctx.fs.contains()` 比较 realpath 派生的 target key，
   因此 `..` 穿越和指向工作区外的软链都会被拒。
@@ -68,7 +86,8 @@ Markdown 文件，点击后在主面板中预览内容。
   与平台自身的文件读取规则一致；遍历时也不会跟随软链目录。
 - **读取上限**：用 `ctx.fs.readByteRange()` 只读前 `maxNoteBytes + 1` 字节，不把整个
   文件读进内存；截断时回退到最后一个换行符，并丢弃结尾不完整的 UTF-8 序列，
-  所以不会出现半个汉字（U+FFFD）。
+  所以不会出现半个汉字（U+FFFD）。遍历与单文件读取都接收 `request.signal`，
+  客户端断开即停止。
 - **错误**：500 只回 `{"error":"internal"}`，绝不回传内部 message（避免泄露主机路径）。
 
 接口是只读的：不写入、不删除任何文件。
@@ -100,8 +119,14 @@ npm test        # node --test "test/*.test.js"
 
 用例覆盖：软链逃逸（工作区外/工作区内两种）、`..` 越界、非 Markdown 与不存在、
 超大文件的截断与 UTF-8 边界、空文件、`maxNotes`/`maxDepth`/跳过目录/顺序、
-配置裁剪、注册表顺序（不再按 `updatedAt` 排序）、鉴权拒绝、方法/端点错误、
+配置裁剪、注册表顺序（不再按 `updatedAt` 排序）、端点/方法错误、HEAD 无正文、
 500 不泄露内部信息。
+
+浏览器半分两层：`client.test.js` 只管接线（模块 id、槽位、样式归属、locale 绑定），
+`client-panel.test.js` 真跑面板组件——它用一个最小但诚实的 hook 运行时（state 写入
+触发重渲染、effect 按依赖比较执行）加假 `fetch`，因此能覆盖「加载 → 选中 → 渲染」
+这条链路。这几条用例都验证过：把对应修复回退后它们会失败——`MarkdownText` 的
+`labels`、列表失败态、以及「工作区列表来自 `useWorkspaces` 而不是自己的请求」。
 
 ## 生效方式
 
