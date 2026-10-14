@@ -20,6 +20,13 @@ Markdown 文件，点击后在主面板中预览内容。
   组装一份并在文案不变时复用同一个对象——`MarkdownText` 以 `labels` 的引用做
   memo，每次渲染新建对象会重建它的组件表。这几个键属于框架 `common` 命名空间
   的公共词表，因此走 `locale.bind` 时由语言包解析，包内只保留无 locale 服务时的兜底。
+- **代码块复制按钮** —— 两条渲染路径都提供。平台渲染器走它自己的代码卡片工具栏
+  （语言名 + 复制/换行），包内兜底渲染器则自带一个「语言名 + 复制」标题栏，
+  两者行为一致：复制围栏正文原文，成功后短暂显示「复制成功」。
+  注意可用性判定不能写成 `typeof MarkdownText === 'function'`：`MarkdownText` 是
+  `memo(function …)`，而 `React.memo` 返回的是**带标记的对象**（`$$typeof` 为
+  `react.memo`）而不是函数，这样的判定会永远为假、静默退回兜底渲染器。
+  插件用 `isComponent()` 同时接受函数与 `memo`/`forwardRef`/`lazy` 三种形态。
 - **笔记间跳转** —— 预览里的 `[另一篇](./other.md)` 会在面板内打开对应笔记
   （通过 `MarkdownDelegateProvider` 的 `openFile` 委托；本地链接在没有委托时是
   纯文本，不会误触发页面跳转）。
@@ -125,8 +132,11 @@ npm test        # node --test "test/*.test.js"
 浏览器半分两层：`client.test.js` 只管接线（模块 id、槽位、样式归属、locale 绑定），
 `client-panel.test.js` 真跑面板组件——它用一个最小但诚实的 hook 运行时（state 写入
 触发重渲染、effect 按依赖比较执行）加假 `fetch`，因此能覆盖「加载 → 选中 → 渲染」
-这条链路。这几条用例都验证过：把对应修复回退后它们会失败——`MarkdownText` 的
-`labels`、列表失败态、以及「工作区列表来自 `useWorkspaces` 而不是自己的请求」。
+这条链路。它把 primitives 桩做成 `memo` 形态（与真实包一致），所以「可用性判定必须
+接受 memo 对象」这条不会被一个假的函数桩掩盖。这几条用例都验证过：把对应修复
+回退后它们会失败——`MarkdownText` 的 `labels`、列表失败态、
+「工作区列表来自 `useWorkspaces` 而不是自己的请求」、
+「`memo` 形态的 `MarkdownText` 必须被选中」、以及「无 primitives 时兜底代码块仍有复制按钮」。
 
 ## 生效方式
 

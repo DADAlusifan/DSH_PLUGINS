@@ -23,6 +23,8 @@ const styleTags = [];
 globalThis.window = {
   __ModuleLoader__: { load: (spec) => registered.set(spec.id, spec) },
   location: { origin: 'http://127.0.0.1:19387' },
+  // The copy control arms a confirmation timer; the browser global owns it.
+  setTimeout: (callback, delay) => setTimeout(callback, delay),
 };
 globalThis.document = {
   getElementById: (id) => styleTags.find((tag) => tag.id === id) ?? null,
@@ -38,15 +40,28 @@ globalThis.document = {
   head: { append: (tag) => styleTags.push(tag) },
 };
 
-/** The primitives stub: the panel must pass real props to these. */
-const primitives = {
-  // eslint-disable-next-line no-unused-vars -- the stub never renders children.
-  MarkdownText: function MarkdownText() {
+/**
+ * A component shaped the way `React.memo` shapes one.
+ *
+ * This matters: the shipped `MarkdownText` is `memo(function …)`, and
+ * `React.memo` returns a tagged object rather than a function. A stub that
+ * hands back a plain function hides any availability check that only accepts
+ * functions — which is exactly the bug this suite must keep caught.
+ * @param render - the underlying render function.
+ * @returns the memo-shaped component.
+ */
+function memoComponent(render) {
+  return { $$typeof: Symbol.for('react.memo'), type: render, compare: null };
+}
+
+/** The primitives stub shaped like the shipped package: memoized components. */
+const shippedPrimitives = {
+  MarkdownText: memoComponent(function MarkdownText() {
     return null;
-  },
-  MarkdownDelegateProvider: function MarkdownDelegateProvider(props) {
+  }),
+  MarkdownDelegateProvider: memoComponent(function MarkdownDelegateProvider(props) {
     return props.children ?? null;
-  },
+  }),
 };
 
 await import('../client.js');
@@ -173,6 +188,26 @@ function createRenderer() {
       return tree;
     },
     /**
+     * Render one nested component element the way React would, on its own hook
+     * slots so the mounted tree's state is untouched.
+     * @param component - the component function.
+     * @param props - its props.
+     * @returns that component's rendered subtree.
+     */
+    render(component, props) {
+      const outerSlots = slots.slice();
+      const outerCursor = cursor;
+      try {
+        cursor = 0;
+        pendingEffects = [];
+        return component(props);
+      } finally {
+        slots.length = 0;
+        slots.push(...outerSlots);
+        cursor = outerCursor;
+      }
+    },
+    /**
      * Let pending promise callbacks land, then render whatever they scheduled.
      * @param turns - microtask turns to drain.
      */
@@ -288,10 +323,11 @@ function noteBody(text) {
 
 /**
  * Mount the panel over a stub fetch, then drive it to a loaded note.
- * @param options - the note source, how `/notes` answers, and the workspace seat.
+ * @param options - the note source, how `/notes` answers, the workspace seat, and
+ *   which primitives module the bundle sees (`null` simulates an older shell).
  * @returns the renderer, the panel tree, and every requested URL.
  */
-async function mountPanel({ text = '# Title\n\nbody\n', notesFails = false, seat = workspaceSeat() } = {}) {
+async function mountPanel({ text = '# Title\n\nbody\n', notesFails = false, seat = workspaceSeat(), modules = shippedPrimitives } = {}) {
   const requested = [];
   globalThis.fetch = async (url) => {
     const target = String(url);
@@ -311,7 +347,10 @@ async function mountPanel({ text = '# Title\n\nbody\n', notesFails = false, seat
   const renderer = createRenderer();
   const module = spec.factory((id) => {
     if (id === 'react') return renderer.React;
-    if (id === '@deepseek-ai/dsh-client-ui-primitives') return primitives;
+    if (id === '@deepseek-ai/dsh-client-ui-primitives') {
+      if (modules === null) throw new Error('module not available: @deepseek-ai/dsh-client-ui-primitives');
+      return modules;
+    }
     throw new Error(`module not available: ${id}`);
   });
   const { ctx, log } = clientContext();
@@ -343,7 +382,7 @@ test('the preview hands MarkdownText the required labels, so a code fence cannot
   const { renderer } = await mountPanel({ text: '# Title\n\n```js\nconst x = 1;\n```\n\n[^n]: footnote body\n' });
   await selectFirstNote(renderer);
 
-  const [markdown] = elementsOfType(renderer.tree, primitives.MarkdownText);
+  const [markdown] = elementsOfType(renderer.tree, shippedPrimitives.MarkdownText);
   assert.ok(markdown !== undefined, 'a loaded note must render through the shipped MarkdownText');
   const labels = markdown.props.labels;
   assert.ok(labels !== undefined && labels !== null, 'MarkdownText requires labels; without them renderCode throws');
@@ -361,14 +400,14 @@ test('the preview hands MarkdownText the required labels, so a code fence cannot
 test('the labels object keeps its identity across re-renders and follows a locale switch', async () => {
   const { renderer } = await mountPanel();
   await selectFirstNote(renderer);
-  const first = elementsOfType(renderer.tree, primitives.MarkdownText)[0].props.labels;
+  const first = elementsOfType(renderer.tree, shippedPrimitives.MarkdownText)[0].props.labels;
 
   // An unrelated state write (the filter) must not mint a new labels object:
   // MarkdownText memoizes on it, so churn would rebuild its component table.
   const input = flatten(renderer.tree).find((value) => typeof value === 'object' && value.type === 'input');
   input.props.onChange({ target: { value: 'a' } });
   await renderer.settle();
-  const second = elementsOfType(renderer.tree, primitives.MarkdownText)[0].props.labels;
+  const second = elementsOfType(renderer.tree, shippedPrimitives.MarkdownText)[0].props.labels;
   assert.equal(second, first, 'an unchanged locale must reuse one labels object');
 
   // Rebinding through a locale service re-resolves the shared common keys.
@@ -376,7 +415,7 @@ test('the labels object keeps its identity across re-renders and follows a local
   const renderer2 = createRenderer();
   const module = spec.factory((id) => {
     if (id === 'react') return renderer2.React;
-    if (id === '@deepseek-ai/dsh-client-ui-primitives') return primitives;
+    if (id === '@deepseek-ai/dsh-client-ui-primitives') return shippedPrimitives;
     throw new Error(`module not available: ${id}`);
   });
   const { ctx: boundCtx, log } = clientContext();
@@ -392,7 +431,7 @@ test('the labels object keeps its identity across re-renders and follows a local
   renderer2.mount(registration.component, { useWorkspaces: workspaceSeat() });
   await renderer2.settle();
   await selectFirstNote(renderer2);
-  const bound = elementsOfType(renderer2.tree, primitives.MarkdownText)[0].props.labels;
+  const bound = elementsOfType(renderer2.tree, shippedPrimitives.MarkdownText)[0].props.labels;
   assert.equal(bound.code.copyLabel, 'Kopieren', 'the labels must come from the bound locale namespace');
   assert.notEqual(bound.code.copyLabel, first.code.copyLabel);
 });
@@ -462,4 +501,55 @@ test('the workspace list comes from the framework seat, not from a request of ou
     ['/api/project-notes/note', '/api/project-notes/notes'],
     'the panel reads only the two endpoints it owns',
   );
+});
+
+test('the shipped renderer is selected even though React.memo returns an object', async () => {
+  // `MarkdownText` is `memo(function …)`: a tagged object, not a function. An
+  // availability check written as `typeof x === 'function'` rejects it, so the
+  // panel silently renders through the bundled fallback and loses the shipped
+  // code-block toolbar (including its copy button).
+  const { renderer } = await mountPanel({ text: '```text\nbody\n```\n' });
+  await selectFirstNote(renderer);
+
+  assert.equal(
+    elementsOfType(renderer.tree, shippedPrimitives.MarkdownText).length,
+    1,
+    'a memo-shaped MarkdownText must be accepted as the renderer',
+  );
+  assert.equal(
+    elementsOfType(renderer.tree, shippedPrimitives.MarkdownDelegateProvider).length,
+    1,
+    'and its delegate provider must be accepted too',
+  );
+});
+
+test('an older shell without the primitives still renders a fenced block, with its own copy button', async () => {
+  // The fallback path must stay useful: it is what a shell missing
+  // `ui-primitives` gets, and it has to offer the same copy affordance rather
+  // than a bare <pre>.
+  const { renderer } = await mountPanel({ text: '```text\nbody line\n```\n', modules: null });
+  await selectFirstNote(renderer);
+
+  const text = textOf(renderer.tree);
+  assert.ok(text.includes('body line'), `the fence body must render, saw: ${text}`);
+  assert.ok(text.includes('text'), `the fence language must be shown, saw: ${text}`);
+
+  // The control is a component element; render it on its own runtime so the
+  // button's own state machine (copy → confirm) runs from a clean start.
+  const control = flatten(renderer.tree).find(
+    (value) => typeof value === 'object' && typeof value.type === 'function' && value.props?.source === 'body line',
+  );
+  assert.ok(control !== undefined, `the fallback code block must render a copy control, saw: ${text}`);
+
+  const writes = [];
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    value: { clipboard: { writeText: (value) => { writes.push(value); return Promise.resolve(); } } },
+  });
+  const button = createRenderer().mount(control.type, control.props);
+  assert.equal(button.type, 'button', 'the copy control must render a button');
+  assert.equal(button.props['aria-label'], '复制', 'and label it for assistive tech');
+  button.props.onClick();
+  await Promise.resolve();
+  assert.deepEqual(writes, ['body line'], 'the button copies the fence body verbatim');
 });

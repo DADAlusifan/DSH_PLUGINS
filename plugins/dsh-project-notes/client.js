@@ -57,9 +57,29 @@ window.__ModuleLoader__.load({
         return null;
       }
     })();
-    const MarkdownText = primitives !== null && typeof primitives.MarkdownText === 'function' ? primitives.MarkdownText : null;
+    /**
+     * Whether one module-table export is a renderable component.
+     *
+     * `MarkdownText` is `memo(function MarkdownText…)`, and `React.memo` returns
+     * a tagged object (`$$typeof: react.memo`) rather than a function, so a
+     * plain `typeof x === 'function'` test rejects the shipped renderer and
+     * silently selects the bundled fallback. Accept both shapes.
+     * @param value - the module export.
+     * @returns true when React can render it.
+     */
+    function isComponent(value) {
+      if (typeof value === 'function') return true;
+      if (value === null || typeof value !== 'object') return false;
+      const tag = value.$$typeof;
+      return (
+        tag === Symbol.for('react.memo') ||
+        tag === Symbol.for('react.forward_ref') ||
+        tag === Symbol.for('react.lazy')
+      );
+    }
+    const MarkdownText = primitives !== null && isComponent(primitives.MarkdownText) ? primitives.MarkdownText : null;
     const MarkdownDelegateProvider =
-      primitives !== null && typeof primitives.MarkdownDelegateProvider === 'function' ? primitives.MarkdownDelegateProvider : null;
+      primitives !== null && isComponent(primitives.MarkdownDelegateProvider) ? primitives.MarkdownDelegateProvider : null;
 
     const DICT = {
       zh: {
@@ -197,6 +217,14 @@ window.__ModuleLoader__.load({
 .dsh-pn-error{color:var(--dsw-alias-state-error-primary,#e05252)}
 .dsh-pn-link{color:var(--dsw-alias-brand-primary,#4d6bfe);text-decoration:none;cursor:pointer}
 .dsh-pn-fallback{line-height:1.75}
+.dsh-pn-code{margin:10px 0;border:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.25));border-radius:8px;overflow:hidden;background:var(--dsw-alias-bg-layer-2,rgba(128,128,128,.13))}
+.dsh-pn-code-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:6px 10px 6px 12px;border-bottom:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.25));font-size:11px;color:var(--dsw-alias-label-secondary,#9aa0a6)}
+.dsh-pn-code-lang{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dsh-pn-code-copy{flex:0 0 auto;border:0;background:transparent;color:inherit;font:inherit;font-size:11px;padding:2px 7px;border-radius:6px;cursor:pointer;transition:background 120ms ease}
+.dsh-pn-code-copy:hover{background:var(--dsw-alias-bg-layer-1,rgba(128,128,128,.07));color:var(--dsw-alias-label-primary,#e8e8e8)}
+.dsh-pn-code-copy:focus-visible{outline:2px solid var(--dsw-alias-brand-primary,#4d6bfe);outline-offset:1px}
+.dsh-pn-code-pre{margin:0;padding:10px 12px;overflow-x:auto}
+.dsh-pn-code-pre code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px;line-height:1.55}
 `;
 
     /** Identifies the stylesheet tag this bundle instance owns. */
@@ -723,6 +751,7 @@ window.__ModuleLoader__.load({
         const fence = /^\s*(```+|~~~+)\s*(.*)$/.exec(line);
         if (fence !== null) {
           const marker = fence[1][0];
+          const language = fence[2].trim();
           const closing = new RegExp(`^\\s*${marker}{3,}\\s*$`);
           const body = [];
           i++;
@@ -731,11 +760,18 @@ window.__ModuleLoader__.load({
             i++;
           }
           i++;
+          const source = body.join('\n');
           blocks.push(
             h(
-              'pre',
-              { key: `b${key++}`, style: { background: 'var(--dsw-alias-bg-layer-2, rgba(128,128,128,.13))', border: '1px solid var(--dsw-alias-border-l1, rgba(128,128,128,.25))', borderRadius: 8, padding: '10px 12px', overflowX: 'auto', margin: '10px 0' } },
-              h('code', { style: { fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace', fontSize: 12.5, lineHeight: 1.55 } }, body.join('\n')),
+              'div',
+              { key: `b${key++}`, className: 'dsh-pn-code' },
+              h(
+                'div',
+                { className: 'dsh-pn-code-head' },
+                h('span', { className: 'dsh-pn-code-lang' }, language === '' ? t('codeBlock.title') : language),
+                h(CodeCopyButton, { source }),
+              ),
+              h('pre', { className: 'dsh-pn-code-pre' }, h('code', null, source)),
             ),
           );
           continue;
@@ -862,6 +898,38 @@ window.__ModuleLoader__.load({
         }),
         h('path', { d: 'M8.75 2.4v3.6h3.6', stroke: 'currentColor', strokeWidth: 1.3, strokeLinejoin: 'round' }),
         h('path', { d: 'M5.9 9.1h4.2M5.9 11.4h4.2', stroke: 'currentColor', strokeWidth: 1.3, strokeLinecap: 'round' }),
+      );
+    }
+
+    /**
+     * Copy one fenced block's source to the clipboard.
+     *
+     * The bundled renderer's counterpart to the shipped renderer's code-card
+     * toolbar: same copy-then-confirm behavior, so the panel offers the control
+     * whichever renderer is in force.
+     * @param props.source - the fence body, verbatim.
+     * @returns the control.
+     */
+    function CodeCopyButton({ source }) {
+      const [copied, setCopied] = React.useState(false);
+      const onCopy = React.useCallback(() => {
+        if (copied) return;
+        const write = navigator.clipboard?.writeText
+          ? navigator.clipboard.writeText(source)
+          : Promise.reject(new Error('no clipboard'));
+        void write.then(
+          () => {
+            setCopied(true);
+            window.setTimeout(() => setCopied(false), 1000);
+          },
+          () => {},
+        );
+      }, [copied, source]);
+      const label = copied ? t('copied') : t('copy');
+      return h(
+        'button',
+        { type: 'button', className: 'dsh-pn-code-copy', title: label, 'aria-label': label, onClick: onCopy },
+        label,
       );
     }
 
